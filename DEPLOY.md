@@ -40,6 +40,10 @@ scp data/harvey.db root@YOUR_VPS_IP:/opt/harvey/data/
 
 Then on the VPS: `chown -R 1000:1000 /opt/harvey/data`
 
+**Set the dashboard password.** On the VPS, edit `/opt/harvey/.env` and set
+`DASHBOARD_PASSWORD=` to a long password (4+ unrelated words). The dashboard
+refuses to start on the server without it.
+
 ## 3. Sign in to Claude on the server (once)
 
 ```bash
@@ -63,14 +67,15 @@ Both services restart automatically after a crash or a VPS reboot.
 
 ## 5. Open the dashboard (SSH tunnel)
 
-The dashboard has no password and can send email, so it is not exposed to the
-internet. From the PC:
+The dashboard can send email, so it has a login page **and** is not exposed to
+the internet. From the PC:
 
 ```powershell
 ssh -L 5555:127.0.0.1:5555 root@YOUR_VPS_IP
 ```
 
-Keep that window open and browse to http://localhost:5555.
+Keep that window open and browse to http://localhost:5555, then sign in with
+your `DASHBOARD_PASSWORD`. Five wrong attempts lock sign-in for 15 minutes.
 
 ## 6. Turn off the PC copy
 

@@ -16,13 +16,14 @@ import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import (
-    HTMLResponse, JSONResponse, PlainTextResponse, Response,
+    HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response,
 )
 
 logger = logging.getLogger("harvey.dashboard")
 
 from harvey.paths import PROJECT_ROOT  # noqa: E402
 from harvey.pidfile import pid_alive, read_pid  # noqa: E402
+from harvey import dashboard_auth  # noqa: E402
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 ENV_FILE = PROJECT_ROOT / ".env"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
@@ -42,6 +43,62 @@ def _resolve_config_file() -> Path:
         return CONFIG_FILE
 
 app = FastAPI(title="Harvey Dashboard")
+
+# Set by start_dashboard(); True means every page and API call needs a login.
+_auth_enabled = bool(dashboard_auth.configured_password())
+
+
+@app.middleware("http")
+async def _require_login(request: Request, call_next):
+    if not _auth_enabled:
+        return await call_next(request)
+    path = request.url.path
+    if request.method not in ("GET", "HEAD", "OPTIONS") and not dashboard_auth.same_origin(
+        request.headers.get("origin"), request.headers.get("host")
+    ):
+        return JSONResponse({"error": "cross-site request refused"}, status_code=403)
+    if path.startswith(dashboard_auth.PUBLIC_PREFIXES):
+        return await call_next(request)
+    if dashboard_auth.valid_session(request.cookies.get(dashboard_auth.COOKIE_NAME)):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return JSONResponse({"error": "login required"}, status_code=401)
+    return RedirectResponse("/login", status_code=303)
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_form():
+    return dashboard_auth.login_page()
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    client = request.client.host if request.client else "unknown"
+    wait = dashboard_auth.locked_out(client)
+    if wait:
+        return HTMLResponse(dashboard_auth.login_page(
+            f"Too many attempts. Try again in {wait // 60 + 1} minute(s)."), status_code=429)
+    from urllib.parse import parse_qs
+    form = parse_qs((await request.body()).decode("utf-8", "replace"))
+    if not dashboard_auth.password_ok((form.get("password") or [""])[0]):
+        dashboard_auth.record_failure(client)
+        await asyncio.sleep(1)  # slow down guessing
+        return HTMLResponse(dashboard_auth.login_page("Wrong password."), status_code=401)
+    dashboard_auth.clear_failures(client)
+    resp = RedirectResponse("/", status_code=303)
+    resp.set_cookie(
+        dashboard_auth.COOKIE_NAME, dashboard_auth.make_session(),
+        max_age=dashboard_auth.SESSION_SECONDS, httponly=True, samesite="strict",
+        secure=request.url.scheme == "https", path="/",
+    )
+    return resp
+
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(dashboard_auth.COOKIE_NAME, path="/")
+    return resp
 
 # Harvey process tracking
 _harvey_process: subprocess.Popen | None = None
@@ -1330,6 +1387,16 @@ async def dashboard():
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
     """Start the dashboard server."""
     import uvicorn
+
+    global _auth_enabled
+    load_dotenv(str(ENV_FILE))
+    if dashboard_auth.auth_required(host) and not dashboard_auth.configured_password():
+        print(f"\n  Refusing to serve the dashboard on {host} without a login.")
+        print("  Set DASHBOARD_PASSWORD in .env (or bind to 127.0.0.1).\n")
+        sys.exit(2)
+    _auth_enabled = dashboard_auth.auth_required(host)
+    if _auth_enabled:
+        print("  Login required (DASHBOARD_PASSWORD is set).")
 
     print(f"\n  Harvey Dashboard running at http://{host}:{port}")
     print("  Press Ctrl+C to stop.\n")

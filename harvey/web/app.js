@@ -128,6 +128,7 @@ function offlineState() {
 async function api(path, opts) {
   try {
     const r = await fetch(path, opts);
+    if (r.status === 401) { window.location.href = '/login'; return null; }
     if (!r.ok) return null;
     return await r.json();
   } catch {
