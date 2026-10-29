@@ -7,6 +7,7 @@ threshold — flips the global kill switch so a bad list can't torch the
 sending domain while nobody's watching.
 """
 
+import re
 import logging
 from datetime import datetime, timezone
 
@@ -224,7 +225,11 @@ class Handler:
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
         text_lower = reply_text.lower()
-        if any(p in text_lower for p in OPT_OUT_PATTERNS):
+        # A reply whose first line is just "STOP" (SMS-style opt-out) is an
+        # opt-out too; the quoted original below it doesn't change that.
+        first_line = next((ln.strip() for ln in text_lower.splitlines() if ln.strip()), "")
+        if (any(p in text_lower for p in OPT_OUT_PATTERNS)
+                or re.fullmatch(r"(please\s+)?stop[.!]*", first_line)):
             intent = "unsubscribe"
         elif any(p in text_lower for p in ESCALATION_PATTERNS):
             intent = "escalate"

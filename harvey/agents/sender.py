@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.gate import pre_send_check
+from harvey.send_window import in_send_window, recipient_timezone
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
@@ -336,6 +337,12 @@ class Sender:
 
     def _render(self, text: str, prospect) -> str:
         """Fill merge variables. The pre-send gate rejects any leftovers."""
+        if prospect.source == "general_inbox":
+            # No person's name: "{{first_name}}, plenty of..." would read
+            # "there, plenty of...", so a leading name becomes a greeting.
+            text = re.sub(r"(?m)^\{\{\s*first_name\s*\}\},?\s*", "Hi there, ", text)
+            text = re.sub(r"(?i)\b(hi|hello|hey|dear)\s+\{\{\s*first_name\s*\}\}",
+                          r"\1 there", text)
         replacements = {
             "first_name": prospect.first_name,
             "last_name": prospect.last_name,
@@ -430,15 +437,32 @@ class Sender:
             return
 
         max_daily = self.config.channels.email.max_daily_sends
-        sent_today = await self.state.count_outbox_sent_today()
-        budget = min(MAX_SENDS_PER_CYCLE, max_daily - sent_today)
+        max_followups = self.config.channels.email.max_daily_followups
+        if max_followups is None:
+            # One shared cap for everything (original behaviour).
+            sent_today = await self.state.count_outbox_sent_today()
+            first_left = followup_left = max_daily - sent_today
+            shared_cap = True
+        else:
+            # Separate budgets: max_daily for first touches, max_followups
+            # for sequence steps 2+.
+            sent_first = await self.state.count_outbox_sent_today(follow_up=False)
+            sent_fu = await self.state.count_outbox_sent_today(follow_up=True)
+            sent_today = sent_first + sent_fu
+            first_left = max_daily - sent_first
+            followup_left = max_followups - sent_fu
+            max_daily = max_daily + max_followups
+            shared_cap = False
+        budget = min(MAX_SENDS_PER_CYCLE,
+                     first_left if shared_cap else max(first_left, 0) + max(followup_left, 0))
         if budget <= 0:
             logger.info(f"Sender: daily send cap reached ({sent_today}/{max_daily}).")
             return
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        # Fetch generously: out-of-window and over-budget items are skipped.
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=budget * 3
+            status="approved", due_before=now, limit=max(budget * 3, 100)
         )
         if self.precleared is not None:
             # Cold emails held by an unavailable compliance check stay
@@ -461,6 +485,7 @@ class Sender:
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sent = 0
+        held_for_window = 0
         # Set when Precleared can't be asked (allowance used up, network):
         # cold emails wait for a later cycle, replies still go out.
         compliance_paused = False
@@ -484,6 +509,20 @@ class Sender:
                     item["id"], status="cancelled",
                     error=f"prospect status '{prospect.status}'",
                 )
+                continue
+
+            # Per-kind daily budgets (first touch vs follow-up).
+            if not shared_cap and item["kind"] == "sequence":
+                is_followup = (item.get("step") or 1) > 1
+                if (followup_left if is_followup else first_left) <= 0:
+                    continue
+
+            # Recipient's local working hours: an out-of-window cold email
+            # stays approved and goes out on a later cycle.
+            if item["kind"] == "sequence" and not await self._in_recipient_window(
+                prospect, item["to_email"]
+            ):
+                held_for_window += 1
                 continue
 
             gate = pre_send_check(
@@ -525,10 +564,23 @@ class Sender:
                     continue
                 receipt_id = clearance.receipt_id
 
+            # Follow-ups go out as real replies in email 1's thread
+            # ("Re: <subject>" + In-Reply-To), so inboxes group them and the
+            # reader sees the context. Honest: it IS a reply to our own email.
+            subject = item["subject"]
+            in_reply_to = item.get("in_reply_to", "")
+            if item["kind"] == "sequence" and (item.get("step") or 1) > 1 and not in_reply_to:
+                root = await self.state.get_sequence_thread_root(item["prospect_id"])
+                if root:
+                    in_reply_to = root["message_id"]
+                    root_subject = root["subject"] or subject
+                    subject = (root_subject if root_subject.lower().startswith("re:")
+                               else f"Re: {root_subject}")
+
             result = await self.provider.send_email(
-                item["to_email"], item["subject"], item["body"],
+                item["to_email"], subject, item["body"],
                 thread_ref=item.get("thread_ref", ""),
-                in_reply_to=item.get("in_reply_to", ""),
+                in_reply_to=in_reply_to,
             )
             if not result.ok:
                 await self.state.update_outbox_item(
@@ -537,9 +589,14 @@ class Sender:
                 continue
 
             sent += 1
+            if not shared_cap and item["kind"] == "sequence":
+                if (item.get("step") or 1) > 1:
+                    followup_left -= 1
+                else:
+                    first_left -= 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             await self.state.update_outbox_item(
-                item["id"], status="sent", sent_at=now_iso,
+                item["id"], status="sent", sent_at=now_iso, subject=subject,
                 message_id=result.message_id, thread_ref=result.thread_ref,
             )
             if prospect.status in ("new", "queued"):
@@ -579,6 +636,26 @@ class Sender:
             if self.send_pacing and sent < budget:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
+        if held_for_window:
+            logger.info(f"Sender: holding {held_for_window} email(s) until the "
+                        "recipient's local working hours.")
         if sent:
             logger.info(f"Sender: {sent} email(s) sent this cycle "
                         f"({sent_today + sent}/{max_daily} today).")
+
+    async def _in_recipient_window(self, prospect, to_email: str) -> bool:
+        """Is it working hours where this recipient is? (True if disabled.)"""
+        window = self.config.usage.recipient_send_window
+        if not window.enabled:
+            return True
+        location = phone = ""
+        if prospect.company_id:
+            try:
+                company = await self.state.get_company(prospect.company_id)
+                if company:
+                    location, phone = company.location, company.phone
+            except Exception as e:
+                logger.debug(f"Sender: company lookup failed: {e}")
+        tz_name = (recipient_timezone(location, to_email, phone or prospect.phone)
+                   or self.config.usage.quiet_hours.timezone)
+        return in_send_window(tz_name, window.start, window.end, window.weekdays_only)

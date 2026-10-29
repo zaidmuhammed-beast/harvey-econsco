@@ -213,11 +213,20 @@ class LinkedInAutomation:
             return True
 
         try:
-            await self.page.fill("#username", self.email)
+            # LinkedIn's login page no longer has stable #username/#password
+            # ids (React-generated ids, and the form is rendered twice for
+            # responsive layouts), so match by role and take the visible one.
+            await self.page.locator(
+                '#username, input[autocomplete^="username"]'
+            ).locator("visible=true").first.fill(self.email)
             await self._random_delay(0.5, 1.5)
-            await self.page.fill("#password", self.password)
+            await self.page.locator(
+                '#password, input[type="password"]'
+            ).locator("visible=true").first.fill(self.password)
             await self._random_delay(0.5, 1.5)
-            await self.page.click('button[type="submit"]')
+            await self.page.locator('button[type="submit"]').or_(
+                self.page.get_by_role("button", name="Sign in", exact=True)
+            ).locator("visible=true").first.click()
             await self._wait_settled()
 
             if "feed" in self.page.url or "mynetwork" in self.page.url:

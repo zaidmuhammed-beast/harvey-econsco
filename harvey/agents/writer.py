@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig
+from harvey.house_followups import with_house_followups
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import StateManager
@@ -60,7 +61,11 @@ class Writer:
         # Only write for prospects we can actually deliver to. Guessed and
         # invalid addresses are skipped so we don't spend Claude calls (or
         # sending reputation) on mail that will bounce.
-        deliverable = {"verified", "risky"}
+        # Match the sender's gate: "risky" (catch-all) only when sending to
+        # risky addresses is enabled, otherwise every such draft just fails.
+        deliverable = {"verified"}
+        if getattr(self.config.channels.email, "send_to_risky", False):
+            deliverable.add("risky")
         prospects_with_email = [
             p for p in new_prospects
             if p.email and (p.email_status or "guess") in deliverable
@@ -88,6 +93,8 @@ class Writer:
             if not sequence:
                 logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
                 continue
+            # Follow-ups are fixed house text, not model-written.
+            sequence = with_house_followups(sequence)
 
             # Create the campaign
             campaign = Campaign(
@@ -170,11 +177,19 @@ class Writer:
 
     async def _write_personal_email(self, prospect) -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
-        facts = [
-            f"- Name: {prospect.full_name()}",
-            f"- Title: {prospect.title}",
-            f"- Company: {prospect.company}",
-        ]
+        if prospect.source == "general_inbox":
+            facts = [
+                f"- Recipient: the company's general inbox ({prospect.email}), "
+                "not a named person. Greet with \"Hi there,\" and never invent "
+                "a name or job title.",
+                f"- Company: {prospect.company}",
+            ]
+        else:
+            facts = [
+                f"- Name: {prospect.full_name()}",
+                f"- Title: {prospect.title}",
+                f"- Company: {prospect.company}",
+            ]
         if prospect.industry:
             facts.append(f"- Industry: {prospect.industry}")
 

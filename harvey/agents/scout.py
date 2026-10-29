@@ -56,7 +56,25 @@ SCRAPE_TIMEOUT = 12.0
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.5  # seconds; grows exponentially per attempt
 MAX_RESULTS_PER_QUERY = 20
-MAX_COMPANIES_PER_CYCLE = 10
+MAX_COMPANIES_PER_CYCLE = 30
+# Words that show up when a team-page heading is mistaken for a person.
+NOT_A_NAME = {
+    "meet", "team", "theteam", "our", "the", "staff", "people", "about",
+    "contact", "us", "leadership", "management", "founders", "directors",
+}
+# General-inbox fallback (info@, hello@...): verified addresses added per
+# cycle, and the pool of unsent contacts to keep topped up (5 sends/day).
+GENERAL_INBOX_PER_CYCLE = 5
+GENERAL_INBOX_TARGET_UNSENT = 15
+GENERAL_INBOX_LOCALS = (
+    "info", "hello", "contact", "enquiries", "inquiries", "office",
+    "reception", "admin", "mail", "team", "hola", "contacto", "clinica",
+)
+GENERAL_INBOX_SKIP = {
+    "noreply", "no-reply", "donotreply", "privacy", "gdpr", "dpo", "abuse",
+    "postmaster", "webmaster", "careers", "jobs", "hr", "rrhh", "empleo",
+    "billing", "invoices", "facturacion", "press", "media", "legal",
+}
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
@@ -597,6 +615,15 @@ class Scout:
 
         logger.info(f"Scout: Backfilling contacts for {len(companies)} known companies...")
 
+        # General-inbox lookups spend verifier credits, so only top up to a
+        # few days' worth of unsent contacts.
+        try:
+            unsent = (await self.state.count_prospects_by_status()).get("new", 0)
+        except Exception:
+            unsent = 0
+        general_budget = max(0, min(GENERAL_INBOX_PER_CYCLE,
+                                    GENERAL_INBOX_TARGET_UNSENT - unsent))
+
         count = 0
         for company in companies:
             domain = (company.get("domain") or "").strip()
@@ -610,6 +637,18 @@ class Scout:
                 industry=company.get("industry") or default_industry,
                 source="known_company_backfill",
             )
+            # Small businesses rarely list named staff. Fall back to the
+            # address they publish (info@, hello@...), which the owner reads.
+            if not contacts and general_budget > 0:
+                inbox = await self._general_inbox_contact(
+                    company_id=company["id"],
+                    domain=domain,
+                    company_name=company.get("name") or self._domain_to_name(domain),
+                    industry=company.get("industry") or default_industry,
+                )
+                if inbox is not None:
+                    general_budget -= 1
+                    contacts = [inbox]
 
             # Mark it checked regardless of outcome, so a company with no
             # scrapable team page rotates out instead of being retried
@@ -1418,6 +1457,9 @@ Respond ONLY with the JSON array."""
             last_name = member.get("last_name", "")
             if not first_name or not last_name:
                 continue
+            # Page headings ("Meet The Team", "Our Staff") aren't people.
+            if {first_name.lower(), last_name.lower()} & NOT_A_NAME:
+                continue
 
             email, email_status = await self._resolve_email(
                 first_name, last_name, domain
@@ -1683,6 +1725,74 @@ Respond ONLY with the JSON array."""
             # checked — don't try more paths for this domain.
             return []
         return []
+
+    async def _general_inbox_contact(
+        self, company_id: str, domain: str, company_name: str, industry: str,
+    ) -> Prospect | None:
+        """The business's published general address, verified, as a contact.
+
+        Stored with first_name "there" so templates greet "Hi there," and
+        source "general_inbox" so the writer and sender know it isn't a person.
+        """
+        from harvey.integrations.email_finder import (
+            _verify_candidate, classify_mx, get_mx_host,
+        )
+
+        base, _ = await self._resolve_base_url(domain)
+        if not base:
+            return None
+        domain = domain.lower()
+        found: list[str] = []
+        for path in ("", "/contact", "/contact-us", "/contacto", "/about"):
+            resp = await self._fetch(f"{base}{path}", timeout=SCRAPE_TIMEOUT, retries=1)
+            if resp is None:
+                continue
+            html = resp.text or ""
+            soup = self._safe_soup(html)
+            if soup is not None:
+                for a in soup.find_all("a", href=True):
+                    href = self._attr_str(a.get("href"))
+                    if href.lower().startswith("mailto:"):
+                        found.append(href[7:].split("?")[0].strip().lower())
+            found += [m.lower() for m in re.findall(
+                r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", html[:200000])]
+            if any(e.endswith("@" + domain) for e in found):
+                break
+
+        candidates = []
+        for addr in dict.fromkeys(found):
+            local, _, adomain = addr.partition("@")
+            if adomain not in (domain, "www." + domain) or local in GENERAL_INBOX_SKIP:
+                continue
+            if re.search(r"\.(png|jpe?g|gif|webp|svg)$", addr):
+                continue
+            rank = (GENERAL_INBOX_LOCALS.index(local)
+                    if local in GENERAL_INBOX_LOCALS else len(GENERAL_INBOX_LOCALS))
+            candidates.append((rank, f"{local}@{domain}"))
+        if not candidates:
+            return None
+        email = sorted(candidates)[0][1]
+
+        prospect = Prospect(
+            first_name="there", last_name="", email=email,
+            company=company_name, company_id=company_id,
+            title="General inbox", industry=industry,
+            source="general_inbox", source_url=f"https://{domain}",
+        )
+        if await self._is_duplicate_prospect(prospect):
+            return None
+
+        mx_type = classify_mx(await get_mx_host(domain) or "")
+        status, _ = await _verify_candidate(email, mx_type, self.env)
+        allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
+        if status != "verified" and not (allow_risky and status == "risky"):
+            logger.info(f"Scout: general inbox {email} not deliverable ({status}).")
+            return None
+        prospect.email_status = status
+        prospect.email_verified = status == "verified"
+        self._remember_prospect(prospect)
+        logger.info(f"Scout: Added general inbox {email} at {company_name}")
+        return prospect
 
     async def _learn_pattern_from_page(self, soup, html: str, domain: str):
         """Find a real on-domain email on a page and cache the derived pattern.

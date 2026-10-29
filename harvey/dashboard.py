@@ -22,6 +22,7 @@ from fastapi.responses import (
 logger = logging.getLogger("harvey.dashboard")
 
 from harvey.paths import PROJECT_ROOT  # noqa: E402
+from harvey.pidfile import pid_alive, read_pid  # noqa: E402
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 ENV_FILE = PROJECT_ROOT / ".env"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
@@ -103,14 +104,8 @@ def _check_harvey_pid() -> int | None:
     global _harvey_process, _harvey_started_at
     if _harvey_process and _harvey_process.poll() is None:
         return _harvey_process.pid
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Check if process exists
-            return pid
-        except (ValueError, ProcessLookupError, PermissionError):
-            PID_FILE.unlink(missing_ok=True)
-    return None
+    # Safe on Windows (os.kill(pid, 0) there would terminate the process).
+    return read_pid()
 
 
 # ── Setup Status ──
@@ -487,20 +482,19 @@ async def stop_harvey():
 
     try:
         os.kill(pid, signal.SIGTERM)
-        # Wait briefly for graceful shutdown
+        # Wait briefly for graceful shutdown (pid_alive never signals).
         for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                await asyncio.sleep(0.5)
-            except ProcessLookupError:
+            if not pid_alive(pid):
                 break
+            await asyncio.sleep(0.5)
         else:
-            # Force kill if still running
+            # Force kill if still running (SIGKILL doesn't exist on Windows,
+            # where SIGTERM is already TerminateProcess).
             try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
                 pass
-    except (ProcessLookupError, PermissionError):
+    except OSError:
         pass
 
     _harvey_process = None

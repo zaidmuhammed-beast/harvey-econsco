@@ -11,6 +11,7 @@ import pytz
 from harvey.brain import Brain
 from harvey.config import ConfigError, load_config, load_env, HarveyConfig
 from harvey.pipeline import run_profile_stage
+from harvey.pidfile import clear_pid, write_pid
 from harvey.state import StateManager
 
 logging.basicConfig(
@@ -121,22 +122,33 @@ async def _run_agents(tasks: list) -> dict:
         return {}
     if len(tasks) > 1:
         logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
+    futures = [asyncio.ensure_future(t[1]) for t in tasks]
     try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*[t[1] for t in tasks], return_exceptions=True),
-            timeout=CYCLE_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
+        done, pending = await asyncio.wait(futures, timeout=CYCLE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        for f in futures:
+            f.cancel()
+        raise
+    if pending:
+        # Only the tasks still running are cut off; finished ones (e.g. a
+        # reply check that took two seconds) keep their outcome, so one slow
+        # agent no longer blocks sending for the whole cycle.
+        still_running = [name for (name, _), f in zip(tasks, futures) if f in pending]
         logger.error(
             f"Cycle timed out after {CYCLE_TIMEOUT_SECONDS}s with "
-            f"{[t[0] for t in tasks]} still running — cancelled, "
+            f"{still_running} still running — cancelled, "
             "moving on to the next heartbeat instead of hanging forever."
         )
-        results = []
+        for f in pending:
+            f.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
     outcomes = {}
-    for (name, _), result in zip(tasks, results):
-        if isinstance(result, asyncio.CancelledError):
-            raise result
+    for (name, _), fut in zip(tasks, futures):
+        if fut not in done:
+            continue
+        if fut.cancelled():
+            raise asyncio.CancelledError()
+        result = fut.exception() or fut.result()
         if isinstance(result, Exception):
             logger.error(f"Agent {name} failed: {result}", exc_info=result)
         outcomes[name] = result
@@ -296,7 +308,9 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # Claude budget the rest of this loop is rationing — and it is what
             # turns a name and a domain into something worth writing about.
             if summary.get("unprofiled", 0):
-                tasks.append(("profile", run_profile_stage(state, limit=25)))
+                # 10, not 25: slow or bot-blocking sites made 25 overrun the
+                # cycle timeout on Windows.
+                tasks.append(("profile", run_profile_stage(state, limit=10)))
 
             outcomes = await _run_agents(tasks)
 
@@ -416,10 +430,15 @@ def main():
         asyncio.run(run_setup())
         return
 
+    # Let the dashboard see this loop however it was started (it otherwise
+    # only knows about loops it launched itself).
+    write_pid()
     try:
         asyncio.run(_run_with_signals())
     except KeyboardInterrupt:
         logger.info("Goodbye.")
+    finally:
+        clear_pid()
 
 
 if __name__ == "__main__":

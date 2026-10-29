@@ -7,12 +7,44 @@ services:
       - ./data:/app/data
       # Mount config for easy editing without rebuild
       - ./harvey.yaml:/app/harvey.yaml:ro
+      # Your trained settings (persona, ICP, send limits). Gitignored, so copy
+      # it to the server yourself; it must exist before `docker compose up`,
+      # or Docker creates an empty directory in its place.
+      - ./harvey.local.yaml:/app/harvey.local.yaml:ro
       - ./prompts:/app/prompts:ro
       - ./skills:/app/skills
       # Mount Claude auth (required for Max plan usage).
       # Not read-only: the CLI refreshes OAuth tokens in place.
       # The container runs as non-root user "harvey" (uid 1000).
       - ~/.claude:/home/harvey/.claude
+    restart: unless-stopped
+    init: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    build: .
+    command: ["python", "-m", "harvey.cli", "dashboard", "--host", "0.0.0.0", "--port", "5555"]
+    env_file: .env
+    # Share the loop's process namespace so the dashboard's "running" check
+    # (data/harvey.pid) sees the same PIDs as the harvey container.
+    pid: "service:harvey"
+    depends_on:
+      - harvey
+    volumes:
+      - ./data:/app/data
+      - ./harvey.yaml:/app/harvey.yaml:ro
+      - ./harvey.local.yaml:/app/harvey.local.yaml:ro
+      - ./prompts:/app/prompts:ro
+      - ./skills:/app/skills
+    # The dashboard has NO password and can approve/send email, so it is only
+    # published on the server's loopback. Reach it with an SSH tunnel:
+    #   ssh -L 5555:127.0.0.1:5555 root@YOUR_VPS_IP   then open http://localhost:5555
+    ports:
+      - "127.0.0.1:5555:5555"
     restart: unless-stopped
     init: true
     logging:

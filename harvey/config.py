@@ -75,6 +75,10 @@ class EmailChannelConfig(BaseModel):
     # SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
     provider: str = "instantly"
     max_daily_sends: int = 50
+    # Separate daily budget for follow-ups (sequence steps 2+). When set,
+    # max_daily_sends only counts first-touch emails; when unset (default),
+    # follow-ups share max_daily_sends as before.
+    max_daily_followups: int | None = None
     # When True, also send to catch-all ("risky") domains, not just verified
     # mailboxes. Off by default — catch-alls accept everything, so a bad
     # guess still bounces.
@@ -185,10 +189,35 @@ class QuietHoursConfig(BaseModel):
         return v
 
 
+class RecipientSendWindowConfig(BaseModel):
+    """Only send cold email during the RECIPIENT's local working hours.
+
+    The recipient's timezone comes from their company's location (or their
+    email's country TLD); unknown recipients use quiet_hours.timezone.
+    Replies to people who wrote to us are not held.
+    """
+    enabled: bool = False
+    start: str = "08:00"
+    end: str = "18:00"
+    weekdays_only: bool = True
+
+    @field_validator("start", "end")
+    @classmethod
+    def _valid_time(cls, v: str) -> str:
+        try:
+            _time.fromisoformat(v)
+        except ValueError:
+            raise ValueError(
+                f"'{v}' is not a valid time. Use 24h HH:MM format, e.g. '08:00'."
+            )
+        return v
+
+
 class UsageConfig(BaseModel):
     max_daily_claude_percent: float = 80.0
     heartbeat_interval_minutes: int = 15
     quiet_hours: QuietHoursConfig = QuietHoursConfig()
+    recipient_send_window: RecipientSendWindowConfig = RecipientSendWindowConfig()
 
     @field_validator("max_daily_claude_percent")
     @classmethod

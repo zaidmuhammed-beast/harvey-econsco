@@ -939,13 +939,32 @@ class StateManager:
             ) as cursor:
                 return (await cursor.fetchone())[0]
 
-    async def count_outbox_sent_today(self) -> int:
+    async def count_outbox_sent_today(self, follow_up: bool | None = None) -> int:
+        """Emails sent today. follow_up=False: first touches only (sequence
+        step 1); True: sequence steps 2+; None: everything."""
+        sql = ("SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
+               "AND date(sent_at) = date('now')")
+        if follow_up is False:
+            sql += " AND kind = 'sequence' AND step <= 1"
+        elif follow_up is True:
+            sql += " AND kind = 'sequence' AND step > 1"
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
-                "AND date(sent_at) = date('now')"
-            ) as cursor:
+            async with db.execute(sql) as cursor:
                 return (await cursor.fetchone())[0]
+
+    async def get_sequence_thread_root(self, prospect_id: str) -> dict | None:
+        """The first sent sequence email to this prospect (the thread a
+        follow-up should reply into), or None if nothing was sent yet."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE prospect_id = ? AND kind = 'sequence' "
+                "AND status = 'sent' AND message_id != '' "
+                "ORDER BY step ASC, sent_at ASC LIMIT 1",
+                (prospect_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
 
     async def find_outbox_by_message_id(self, message_id: str) -> dict | None:
         if not message_id:
