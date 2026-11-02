@@ -30,6 +30,8 @@ logger = logging.getLogger("harvey.sender")
 # Max sends drained per heartbeat cycle — spreads volume through the day
 # instead of bursting the daily cap in one minute.
 MAX_SENDS_PER_CYCLE = 8
+# Minimum days between a follow-up and the previous email actually sent.
+FOLLOWUP_MIN_GAP_DAYS = 3
 SEND_JITTER_SECONDS = (4, 15)
 
 # Prospect pipeline statuses that mean "stop emailing this person".
@@ -486,6 +488,7 @@ class Sender:
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sent = 0
         held_for_window = 0
+        domains_sent_this_cycle: set[str] = set()
         # Set when Precleared can't be asked (allowance used up, network):
         # cold emails wait for a later cycle, replies still go out.
         compliance_paused = False
@@ -510,6 +513,29 @@ class Sender:
                     error=f"prospect status '{prospect.status}'",
                 )
                 continue
+
+            # A follow-up waits until the previous step actually went out at
+            # least FOLLOWUP_MIN_GAP_DAYS ago. send_at is fixed when the
+            # sequence is staged, so an outage that delays step 2 would
+            # otherwise let step 3 go first, or minutes after step 2.
+            if item["kind"] == "sequence" and (item.get("step") or 1) > 1:
+                prev_sent = await self.state.previous_step_sent_at(
+                    item["prospect_id"], item["step"]
+                )
+                if not prev_sent or prev_sent > (
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    - timedelta(days=FOLLOWUP_MIN_GAP_DAYS)
+                ).isoformat():
+                    continue
+
+            # One cold email per company domain per day: several staff at one
+            # firm getting the same email at once reads as a mass mailing.
+            if item["kind"] == "sequence":
+                domain = item["to_email"].rsplit("@", 1)[-1].lower()
+                if domain in domains_sent_this_cycle or (
+                    await self.state.sequence_sent_today_to_domain(domain)
+                ):
+                    continue
 
             # Per-kind daily budgets (first touch vs follow-up).
             if not shared_cap and item["kind"] == "sequence":
@@ -589,6 +615,8 @@ class Sender:
                 continue
 
             sent += 1
+            if item["kind"] == "sequence":
+                domains_sent_this_cycle.add(item["to_email"].rsplit("@", 1)[-1].lower())
             if not shared_cap and item["kind"] == "sequence":
                 if (item.get("step") or 1) > 1:
                     followup_left -= 1

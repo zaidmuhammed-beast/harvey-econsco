@@ -952,6 +952,27 @@ class StateManager:
             async with db.execute(sql) as cursor:
                 return (await cursor.fetchone())[0]
 
+    async def sequence_sent_today_to_domain(self, domain: str) -> int:
+        """Cold (sequence) emails sent today to any address at this domain."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND kind = 'sequence' "
+                "AND date(sent_at) = date('now') AND LOWER(to_email) LIKE ?",
+                ("%@" + domain.lower(),),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    async def previous_step_sent_at(self, prospect_id: str, step: int) -> str | None:
+        """When sequence step `step - 1` was sent to this prospect, or None."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT MAX(sent_at) FROM outbox WHERE prospect_id = ? "
+                "AND kind = 'sequence' AND step = ? AND status = 'sent'",
+                (prospect_id, step - 1),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row and row[0] else None
+
     async def get_sequence_thread_root(self, prospect_id: str) -> dict | None:
         """The first sent sequence email to this prospect (the thread a
         follow-up should reply into), or None if nothing was sent yet."""
