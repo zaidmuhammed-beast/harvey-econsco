@@ -70,6 +70,15 @@ class Writer:
             p for p in new_prospects
             if p.email and (p.email_status or "guess") in deliverable
         ]
+        # Retire the rest: left as "new" they never get an email, yet keep
+        # the heartbeat choosing write_campaign over prospecting forever.
+        for p in new_prospects:
+            if p not in prospects_with_email:
+                await self.state.update_prospect_status(p.id, "unreachable")
+                logger.info(
+                    f"Writer: {p.email or p.full_name()} marked unreachable "
+                    f"(email status '{p.email_status or 'none'}')."
+                )
         if not prospects_with_email:
             logger.info(
                 "Writer: No prospects with deliverable (verified/risky) emails yet."

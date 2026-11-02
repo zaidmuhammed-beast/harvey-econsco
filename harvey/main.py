@@ -10,6 +10,8 @@ import pytz
 
 from harvey.brain import Brain
 from harvey.config import ConfigError, load_config, load_env, HarveyConfig
+from harvey.integrations.mail_provider import NATIVE_PROVIDERS
+from harvey.paths import PROJECT_ROOT
 from harvey.pipeline import run_profile_stage
 from harvey.pidfile import clear_pid, write_pid
 from harvey.state import StateManager
@@ -95,7 +97,12 @@ async def decide_next_action(
     draft_campaigns = summary.get("draft_campaigns", 0) or 0
     open_conversations = summary.get("open_conversations", 0) or 0
 
-    if open_conversations > 0:
+    # Native mail providers read replies every cycle regardless of the
+    # decision (see the read_replies task in heartbeat), so an open
+    # conversation, the normal state with an interested prospect, must not
+    # take the slot and starve prospecting/writing indefinitely.
+    native = config.channels.email.provider in NATIVE_PROVIDERS
+    if open_conversations > 0 and not native:
         action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
     elif draft_campaigns > 0:
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
@@ -262,6 +269,19 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 if await _interruptible_sleep(3600, stop_event):
                     break
                 continue
+
+            # A full disk makes every database write fail ("disk I/O error"),
+            # which stalled Harvey for days once. Warn well before that.
+            try:
+                import shutil
+                free_mb = shutil.disk_usage(PROJECT_ROOT / "data").free // (1024 * 1024)
+                if free_mb < 1024:
+                    logger.warning(
+                        f"Disk almost full: {free_mb} MB free on Harvey's data drive. "
+                        "Free some space or the database will stop saving."
+                    )
+            except OSError:
+                pass
 
             # 4. Decide what to do
             logger.info("Checking pipeline state...")

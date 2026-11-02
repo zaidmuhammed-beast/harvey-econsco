@@ -487,7 +487,13 @@ async def get_harvey_status():
     """Check if Harvey is currently running."""
     pid = _check_harvey_pid()
     started = _harvey_started_at.isoformat() if _harvey_started_at else None
-    return {"running": pid is not None, "pid": pid, "started_at": started}
+    import shutil
+    try:
+        disk_free_mb = shutil.disk_usage(DB_PATH.parent).free // (1024 * 1024)
+    except OSError:
+        disk_free_mb = None
+    return {"running": pid is not None, "pid": pid, "started_at": started,
+            "disk_free_mb": disk_free_mb, "disk_low": disk_free_mb is not None and disk_free_mb < 1024}
 
 
 @app.post("/api/harvey/start")

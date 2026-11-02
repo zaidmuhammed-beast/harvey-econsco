@@ -805,6 +805,11 @@ async function loadHarveyStatus() {
 
   headerDot.className = 'status-dot ' + (running ? 'running' : 'stopped');
   headerText.textContent = running ? 'Harvey is running' : 'Harvey is stopped';
+  if (data.disk_low) {
+    // A full disk stops Harvey saving anything (it stalled on Oct 31).
+    headerDot.className = 'status-dot offline';
+    headerText.textContent = '⚠ Disk almost full (' + escHtml(String(data.disk_free_mb)) + ' MB free)';
+  }
   document.getElementById('control-dot').className = 'dot ' + (running ? 'running' : 'stopped');
   const label = document.getElementById('control-label');
   label.className = 'label ' + (running ? 'running' : 'stopped');
