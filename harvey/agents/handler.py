@@ -431,6 +431,21 @@ class Handler:
         prospect = None
         if outbox_item:
             prospect = await self.state.get_prospect(outbox_item["prospect_id"])
+        if prospect is None:
+            # Relays such as MailChannels (Hostinger) send DSNs without an
+            # In-Reply-To; the failed address is in the report text instead,
+            # e.g. "<a@b.co.uk>: host mx.. said: 550 ...". Match it to a
+            # prospect we have emailed, ignoring our own mailbox.
+            own = {(getattr(self.provider, "smtp_user", "") or "").lower(),
+                   (self.config.persona.email or "").lower()}
+            for addr in dict.fromkeys(re.findall(
+                    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", msg.body or "")):
+                addr = addr.lower()
+                if addr in own or addr.startswith(("mailer-daemon", "postmaster")):
+                    continue
+                prospect = await self.state.get_prospect_by_email(addr)
+                if prospect:
+                    break
 
         if prospect:
             await self.state.update_prospect_email(
